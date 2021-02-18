@@ -46,6 +46,8 @@ class LoadInputsAndTargets(object):
         sort_in_input_length=True,
         use_speaker_embedding=False,
         use_second_target=False,
+        use_character_embedding=False,
+        use_intonation_type=False,
         preprocess_args=None,
         keep_all_data_on_mem=False,
     ):
@@ -75,12 +77,25 @@ class LoadInputsAndTargets(object):
                 '"use_second_target" and "use_speaker_embedding" is '
                 "used only for tts or vc mode"
             )
+        if use_second_target and use_character_embedding:
+            raise ValueError(
+                'Choose one of "use_second_target" and "use_character_embedding"'
+            )
+        if use_intonation_type and (not use_character_embedding):
+            raise ValueError(
+                'Set "use_character_embedding" true and prepare something '
+                + 'in data.json, when using intonation type, even if you do '
+                + 'not use character embeddings. '
+                + 'This is for correct data loading.'
+            )
 
         self.mode = mode
         self.load_output = load_output
         self.load_input = load_input
         self.sort_in_input_length = sort_in_input_length
         self.use_speaker_embedding = use_speaker_embedding
+        self.use_character_embedding = use_character_embedding
+        self.use_intonation_type = use_intonation_type
         self.use_second_target = use_second_target
         if preprocess_args is None:
             self.preprocess_args = {}
@@ -132,7 +147,6 @@ class LoadInputsAndTargets(object):
                             filepath=inp["feat"], filetype=inp.get("filetype", "mat")
                         )
                     x_feats_dict.setdefault(inp["name"], []).append(x)
-
             if self.load_output:
                 if self.mode == "mt":
                     x = np.fromiter(
@@ -147,6 +161,14 @@ class LoadInputsAndTargets(object):
                         x = np.fromiter(
                             map(int, inp["tokenid"].split()), dtype=np.int64
                         )
+                    elif "char_emb" in inp:
+                        # x = np.load(inp["char_emb"])
+                        x = self._get_from_loader(
+                            filepath=inp["char_emb"],
+                            filetype="npy"
+                        )
+                    elif "into_type" in inp:
+                        x = np.array(int(inp["into_type"]))
                     else:
                         # ======= New format =======
                         # {"input":
@@ -340,44 +362,75 @@ class LoadInputsAndTargets(object):
 
             spembs = None
             spcs = None
+            chembs = None
+            intotypes = None
             spembs_name = "spembs_none"
             spcs_name = "spcs_none"
+            chembs_name = "chembs_none"
+            intotypes_name = "intotypes_none"
 
             if self.use_second_target:
                 spcs = list(x_feats_dict.values())[1]
                 spcs = [spcs[i] for i in nonzero_sorted_idx]
                 spcs_name = list(x_feats_dict.keys())[1]
-
             if self.use_speaker_embedding:
                 spembs = list(x_feats_dict.values())[1]
                 spembs = [spembs[i] for i in nonzero_sorted_idx]
                 spembs_name = list(x_feats_dict.keys())[1]
+            if self.use_character_embedding:
+                chembs = list(y_feats_dict.values())[1]
+                chembs = [chembs[i] for i in nonzero_sorted_idx]
+                # Original character embeddings should be upsampled
+                # to match the lengths of phonemes.
+                # Further padding maintains length match after
+                # adding <eos> to phonemes.
+                chembs = [np.pad(chemb, ((0,1),(0,0)), 'constant', constant_values=0)
+                    for chemb in chembs
+                ]
+                chembs_name = list(y_feats_dict.keys())[1]
+            if self.use_intonation_type:
+                intotypes = list(y_feats_dict.values())[2]
+                intotypes = [intotypes[i] for i in nonzero_sorted_idx]
+                intotypes_name = list(y_feats_dict.keys())[2]
 
             x_name = list(y_feats_dict.keys())[0]
             y_name = list(x_feats_dict.keys())[0]
 
             return_batch = OrderedDict(
-                [(x_name, xs), (y_name, ys), (spembs_name, spembs), (spcs_name, spcs)]
+                [(x_name, xs), (y_name, ys),
+                (spembs_name, spembs), (spcs_name, spcs),
+                (chembs_name, chembs), (intotypes_name, intotypes)]
             )
-        elif self.use_speaker_embedding:
-            if len(x_feats_dict) == 0:
-                raise IndexError("No speaker embedding is provided")
-            elif len(x_feats_dict) == 1:
-                spembs_idx = 0
-            else:
-                spembs_idx = 1
-
-            spembs = list(x_feats_dict.values())[spembs_idx]
-            spembs = [spembs[i] for i in nonzero_sorted_idx]
-
-            x_name = list(y_feats_dict.keys())[0]
-            spembs_name = list(x_feats_dict.keys())[spembs_idx]
-
-            return_batch = OrderedDict([(x_name, xs), (spembs_name, spembs)])
         else:
             x_name = list(y_feats_dict.keys())[0]
-
             return_batch = OrderedDict([(x_name, xs)])
+            if self.use_speaker_embedding:
+                if len(x_feats_dict) == 0:
+                    raise IndexError("No speaker embedding is provided")
+                elif len(x_feats_dict) == 1:
+                    spembs_idx = 0
+                else:
+                    spembs_idx = 1
+
+                spembs = list(x_feats_dict.values())[spembs_idx]
+                spembs = [spembs[i] for i in nonzero_sorted_idx]
+
+                x_name = list(y_feats_dict.keys())[0]
+                spembs_name = list(x_feats_dict.keys())[spembs_idx]
+
+                return_batch = OrderedDict([(x_name, xs), (spembs_name, spembs)])
+            
+            if self.use_character_embedding:
+                chembs = list(y_feats_dict.values())[1]
+                chembs = [chembs[i] for i in nonzero_sorted_idx]
+                chembs_name = list(y_feats_dict.keys())[1]
+                return_batch.update({chembs_name:chembs})
+
+            if self.use_intonation_type:
+                intotypes = list(y_feats_dict.values())[2]
+                intotypes = [intotypes[i] for i in nonzero_sorted_idx]
+                intotypes_name = list(y_feats_dict.keys())[2]
+                return_batch.update({intotypes_name:intotypes})
         return return_batch, uttid_list
 
     def _create_batch_vc(self, x_feats_dict, y_feats_dict, uttid_list):

@@ -287,6 +287,18 @@ def get_parser():
         type=lambda s: [str(mod) for mod in s.split(",") if s != ""],
         help="List of modules to freeze (not to train), separated by a comma.",
     )
+    parser.add_argument(
+        "--use-character-embedding",
+        default=False,
+        type=strtobool,
+        help="Whether to use character embedding",
+    )
+    parser.add_argument(
+        "--use-intonation-type",
+        default=False,
+        type=strtobool,
+        help="Whether to use intonation type",
+    )
 
     return parser
 

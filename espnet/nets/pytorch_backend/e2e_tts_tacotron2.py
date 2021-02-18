@@ -586,6 +586,7 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         self.idim = idim
         self.odim = odim
         self.spk_embed_dim = args.spk_embed_dim
+        self.char_embed_dim = args.char_embed_dim
         self.cumulate_att_w = args.cumulate_att_w
         self.reduction_factor = args.reduction_factor
         self.use_cbhg = args.use_cbhg
@@ -618,10 +619,29 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             dropout_rate=args.dropout_rate,
             padding_idx=padding_idx,
         )
+        if args.char_embed_dim is not None:
+            self.ch_enc = Encoder(
+                idim=args.char_embed_dim,
+                input_layer="linear",
+                embed_dim=0,
+                elayers=args.elayers,
+                eunits=args.eunits,
+                econv_layers=args.econv_layers,
+                econv_chans=args.econv_chans,
+                econv_filts=args.econv_filts,
+                use_batch_norm=args.use_batch_norm,
+                use_residual=args.use_residual,
+                dropout_rate=args.dropout_rate,
+                padding_idx=padding_idx,
+            )
         dec_idim = (
-            args.eunits
-            if args.spk_embed_dim is None
+            args.eunits * 2 + args.spk_embed_dim
+            if args.char_embed_dim and args.spk_embed_dim
             else args.eunits + args.spk_embed_dim
+            if args.spk_embed_dim
+            else args.eunits * 2
+            if args.char_embed_dim
+            else args.eunits
         )
         if args.atype == "location":
             att = AttLoc(
@@ -700,7 +720,7 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             self.load_pretrained_model(args.pretrained_model)
 
     def forward(
-        self, xs, ilens, ys, labels, olens, spembs=None, extras=None, *args, **kwargs
+        self, xs, ilens, ys, labels, olens, chembs=None, intotypes=None, spembs=None, extras=None, *args, **kwargs
     ):
         """Calculate forward propagation.
 
@@ -732,6 +752,11 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         if self.spk_embed_dim is not None:
             spembs = F.normalize(spembs).unsqueeze(1).expand(-1, hs.size(1), -1)
             hs = torch.cat([hs, spembs], dim=-1)
+
+        if self.char_embed_dim is not None:
+            ch_hs, _ = self.ch_enc(chembs, ilens)
+            hs = torch.cat([hs, ch_hs], dim=-1)
+        
         after_outs, before_outs, logits, att_ws = self.dec(hs, hlens, ys)
 
         # modifiy mod part of groundtruth
@@ -787,7 +812,7 @@ class Tacotron2(TTSInterface, torch.nn.Module):
 
         return loss
 
-    def inference(self, x, inference_args, spemb=None, *args, **kwargs):
+    def inference(self, x, inference_args, chemb=None, intotype=None, spemb=None, *args, **kwargs):
         """Generate the sequence of features given the sequences of characters.
 
         Args:
@@ -836,7 +861,7 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             return outs, probs, att_ws
 
     def calculate_all_attentions(
-        self, xs, ilens, ys, spembs=None, keep_tensor=False, *args, **kwargs
+        self, xs, ilens, ys, chembs=None, intotypes=None, spembs=None, keep_tensor=False, *args, **kwargs
     ):
         """Calculate all of the attention weights.
 
@@ -863,6 +888,9 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             if self.spk_embed_dim is not None:
                 spembs = F.normalize(spembs).unsqueeze(1).expand(-1, hs.size(1), -1)
                 hs = torch.cat([hs, spembs], dim=-1)
+            if self.char_embed_dim is not None:
+                ch_hs, _ = self.ch_enc(chembs, ilens)
+                hs = torch.cat([hs, ch_hs], dim=-1)
             att_ws = self.dec.calculate_all_attentions(hs, hlens, ys)
         self.train()
 

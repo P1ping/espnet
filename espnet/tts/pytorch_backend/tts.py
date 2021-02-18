@@ -223,7 +223,8 @@ class CustomConverter(object):
         """
         # batch should be located in list
         assert len(batch) == 1
-        xs, ys, spembs, extras = batch[0]
+        xs, ys, spembs, extras, chembs, intotypes = batch[0]
+        
 
         # get list of lengths (must be tensor for DataParallel)
         ilens = torch.from_numpy(np.array([x.shape[0] for x in xs])).long().to(device)
@@ -257,6 +258,16 @@ class CustomConverter(object):
             extras = pad_list([torch.from_numpy(extra).float() for extra in extras], 0)
             new_batch["extras"] = extras.to(device)
 
+        # load character embedding
+        if chembs is not None:
+            chembs = pad_list([torch.from_numpy(chemb).float() for chemb in chembs], 0)
+            new_batch["chembs"] = chembs.to(device)
+
+        # load intonation type
+        if intotypes is not None:
+            intotypes = torch.from_numpy(np.array(intotypes)).long()
+            new_batch["intotypes"] = intotypes.to(device)
+
         return new_batch
 
 
@@ -288,6 +299,11 @@ def train(args):
         args.spc_dim = int(valid_json[utts[0]]["input"][1]["shape"][1])
     else:
         args.spc_dim = None
+    if args.use_character_embedding:
+        logging.info("\nUsing character embeddings? Hahah!\n")
+        args.char_embed_dim = 768
+    else:
+        args.char_embed_dim = None
 
     # write model config
     if not os.path.exists(args.outdir):
@@ -411,6 +427,8 @@ def train(args):
         mode="tts",
         use_speaker_embedding=args.use_speaker_embedding,
         use_second_target=args.use_second_target,
+        use_character_embedding=args.use_character_embedding,
+        use_intonation_type=args.use_intonation_type,
         preprocess_conf=args.preprocess_conf,
         preprocess_args={"train": True},  # Switch the mode of preprocessing
         keep_all_data_on_mem=args.keep_all_data_on_mem,
@@ -420,6 +438,8 @@ def train(args):
         mode="tts",
         use_speaker_embedding=args.use_speaker_embedding,
         use_second_target=args.use_second_target,
+        use_character_embedding=args.use_character_embedding,
+        use_intonation_type=args.use_intonation_type,
         preprocess_conf=args.preprocess_conf,
         preprocess_args={"train": False},  # Switch the mode of preprocessing
         keep_all_data_on_mem=args.keep_all_data_on_mem,
