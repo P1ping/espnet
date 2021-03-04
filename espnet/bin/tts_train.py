@@ -13,11 +13,14 @@ import sys
 
 import configargparse
 import numpy as np
+import torch
+import torch.distributed as dist
 
 from espnet import __version__
 from espnet.nets.tts_interface import TTSInterface
 from espnet.utils.cli_utils import strtobool
 from espnet.utils.training.batchfy import BATCH_COUNT_CHOICES
+
 
 
 # NOTE: you need this func to generate our sphinx doc
@@ -288,6 +291,12 @@ def get_parser():
         help="List of modules to freeze (not to train), separated by a comma.",
     )
     parser.add_argument(
+        "--local_rank",
+        default=0,
+        type=int,
+        help="Rank of the local device for distributed trianing"
+    )
+    parser.add_argument(
         "--use-character-embedding",
         default=False,
         type=strtobool,
@@ -298,6 +307,18 @@ def get_parser():
         default=False,
         type=strtobool,
         help="Whether to use intonation type",
+    )
+    parser.add_argument(
+        "--into-embed-dim",
+        default=None,
+        type=int,
+        help="Number of intonation embedding dimensions"
+    )
+    parser.add_argument(
+        "--use-intotype-loss",
+        default=False,
+        type=strtobool,
+        help="Whether to use intonation type loss"
     )
 
     return parser
@@ -335,24 +356,26 @@ def main(cmd_args):
     #   1. if CUDA_VISIBLE_DEVICES is set, all visible devices
     #   2. if nvidia-smi exists, use all devices
     #   3. else ngpu=0
-    if args.ngpu is None:
-        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if cvd is not None:
-            ngpu = len(cvd.split(","))
-        else:
-            logging.warning("CUDA_VISIBLE_DEVICES is not set.")
-            try:
-                p = subprocess.run(
-                    ["nvidia-smi", "-L"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                )
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                ngpu = 0
-            else:
-                ngpu = len(p.stderr.decode().split("\n")) - 1
-        args.ngpu = ngpu
-    else:
-        ngpu = args.ngpu
-    logging.info(f"ngpu: {ngpu}")
+    # if args.ngpu is None:
+    #     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    #     if cvd is not None:
+    #         ngpu = len(cvd.split(","))
+    #     else:
+    #         logging.warning("CUDA_VISIBLE_DEVICES is not set.")
+    #         try:
+    #             p = subprocess.run(
+    #                 ["nvidia-smi", "-L"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    #             )
+    #         except (subprocess.CalledProcessError, FileNotFoundError):
+    #             ngpu = 0
+    #         else:
+    #             ngpu = len(p.stderr.decode().split("\n")) - 1
+    #     args.ngpu = ngpu
+    # else:
+    #     ngpu = args.ngpu
+    # logging.info(f"ngpu: {ngpu}")
+
+    torch.cuda.set_device(args.local_rank)
 
     # set random seed
     logging.info("random seed = %d" % args.seed)
@@ -361,6 +384,8 @@ def main(cmd_args):
 
     if args.backend == "pytorch":
         from espnet.tts.pytorch_backend.tts import train
+        
+        dist.init_process_group(backend='nccl', init_method='env://')
 
         train(args)
     else:

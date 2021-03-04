@@ -3,13 +3,14 @@
 # Copyright 2019 Nagoya University (Tomoki Hayashi)
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
-db=$1
-transcript=$2
-data_dir=$3
+db_main=$1
+db_aux=$2
+transcript=$3
+data_dir=$4
 
 # check arguments
-if [ $# != 3 ]; then
-    echo "Usage: $0 <db> <transcript> <data_dir>"
+if [ $# != 4 ]; then
+    echo "Usage: $0 <db_main> <db_aux> <transcript> <data_dir>"
     exit 1
 fi
 
@@ -35,9 +36,16 @@ echo "Successfully finished making text."
 
 # make scp, utt2spk, and spk2utt
 cat ${transcript} | cut -d ' ' -f 1 | sort | while read -r id; do
-    filename="${db}/TTSdata700/${id}.wav"
-    echo "${id} ${filename}" >> ${scp}
-    echo "${id} can700" >> ${utt2spk}
+    
+    if [ ${id:0:6} == "CANTTS" ]; then
+        filename="${db_main}/${id}.wav"
+        echo "${id} ${filename}" >> ${scp}
+        echo "${id} ${id:7:2}" >> ${utt2spk}
+    else
+        filename="${db_aux}/${id}.wav"
+        echo "${id} ${filename}" >> ${scp}
+        echo "${id} LJ" >> ${utt2spk}
+    fi
 done
 echo "Successfully finished making wav.scp, utt2spk."
 

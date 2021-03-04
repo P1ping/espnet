@@ -81,13 +81,13 @@ class LoadInputsAndTargets(object):
             raise ValueError(
                 'Choose one of "use_second_target" and "use_character_embedding"'
             )
-        if use_intonation_type and (not use_character_embedding):
-            raise ValueError(
-                'Set "use_character_embedding" true and prepare something '
-                + 'in data.json, when using intonation type, even if you do '
-                + 'not use character embeddings. '
-                + 'This is for correct data loading.'
-            )
+        # if use_intonation_type and (not use_character_embedding):
+        #     raise ValueError(
+        #         'Set "use_character_embedding" true and prepare something '
+        #         + 'in data.json, when using intonation type, even if you do '
+        #         + 'not use character embeddings. '
+        #         + 'This is for correct data loading.'
+        #     )
 
         self.mode = mode
         self.load_output = load_output
@@ -369,6 +369,29 @@ class LoadInputsAndTargets(object):
             chembs_name = "chembs_none"
             intotypes_name = "intotypes_none"
 
+            # if self.use_second_target:
+            #     spcs = list(x_feats_dict.values())[1]
+            #     spcs = [spcs[i] for i in nonzero_sorted_idx]
+            #     spcs_name = list(x_feats_dict.keys())[1]
+            # if self.use_speaker_embedding:
+            #     spembs = list(x_feats_dict.values())[1]
+            #     spembs = [spembs[i] for i in nonzero_sorted_idx]
+            #     spembs_name = list(x_feats_dict.keys())[1]
+            # if self.use_character_embedding:
+            #     chembs = list(y_feats_dict.values())[1]
+            #     chembs = [chembs[i] for i in nonzero_sorted_idx]
+            #     # Original character embeddings should be upsampled
+            #     # to match the lengths of phonemes.
+            #     # Further padding maintains length match after
+            #     # adding <eos> to phonemes.
+            #     chembs = [np.pad(chemb, ((0,1),(0,0)), 'constant', constant_values=0)
+            #         for chemb in chembs
+            #     ]
+            #     chembs_name = list(y_feats_dict.keys())[1]
+            # if self.use_intonation_type:
+            #     intotypes = list(y_feats_dict.values())[2]
+            #     intotypes = [intotypes[i] for i in nonzero_sorted_idx]
+            #     intotypes_name = list(y_feats_dict.keys())[2]
             if self.use_second_target:
                 spcs = list(x_feats_dict.values())[1]
                 spcs = [spcs[i] for i in nonzero_sorted_idx]
@@ -377,8 +400,10 @@ class LoadInputsAndTargets(object):
                 spembs = list(x_feats_dict.values())[1]
                 spembs = [spembs[i] for i in nonzero_sorted_idx]
                 spembs_name = list(x_feats_dict.keys())[1]
+
+            feat_ord = 1
             if self.use_character_embedding:
-                chembs = list(y_feats_dict.values())[1]
+                chembs = list(y_feats_dict.values())[feat_ord]
                 chembs = [chembs[i] for i in nonzero_sorted_idx]
                 # Original character embeddings should be upsampled
                 # to match the lengths of phonemes.
@@ -387,11 +412,13 @@ class LoadInputsAndTargets(object):
                 chembs = [np.pad(chemb, ((0,1),(0,0)), 'constant', constant_values=0)
                     for chemb in chembs
                 ]
-                chembs_name = list(y_feats_dict.keys())[1]
+                chembs_name = list(y_feats_dict.keys())[feat_ord]
+                feat_ord += 1
             if self.use_intonation_type:
-                intotypes = list(y_feats_dict.values())[2]
+                intotypes = list(y_feats_dict.values())[feat_ord]
                 intotypes = [intotypes[i] for i in nonzero_sorted_idx]
-                intotypes_name = list(y_feats_dict.keys())[2]
+                intotypes_name = list(y_feats_dict.keys())[feat_ord]
+                feat_ord += 1
 
             x_name = list(y_feats_dict.keys())[0]
             y_name = list(x_feats_dict.keys())[0]
@@ -415,14 +442,18 @@ class LoadInputsAndTargets(object):
                 spembs = list(x_feats_dict.values())[spembs_idx]
                 spembs = [spembs[i] for i in nonzero_sorted_idx]
 
-                x_name = list(y_feats_dict.keys())[0]
+                # x_name = list(y_feats_dict.keys())[0]
                 spembs_name = list(x_feats_dict.keys())[spembs_idx]
 
-                return_batch = OrderedDict([(x_name, xs), (spembs_name, spembs)])
+                # return_batch = OrderedDict([(x_name, xs), (spembs_name, spembs)])
+                return_batch.update({spembs_name, spembs})
             
             if self.use_character_embedding:
                 chembs = list(y_feats_dict.values())[1]
                 chembs = [chembs[i] for i in nonzero_sorted_idx]
+                chembs = [np.pad(chemb, ((0,1),(0,0)), 'constant', constant_values=0)
+                    for chemb in chembs
+                ]
                 chembs_name = list(y_feats_dict.keys())[1]
                 return_batch.update({chembs_name:chembs})
 

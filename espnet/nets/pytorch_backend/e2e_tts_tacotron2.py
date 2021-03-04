@@ -16,7 +16,7 @@ from espnet.nets.pytorch_backend.rnn.attentions import AttLoc
 from espnet.nets.pytorch_backend.tacotron2.cbhg import CBHG
 from espnet.nets.pytorch_backend.tacotron2.cbhg import CBHGLoss
 from espnet.nets.pytorch_backend.tacotron2.decoder import Decoder
-from espnet.nets.pytorch_backend.tacotron2.encoder import Encoder
+from espnet.nets.pytorch_backend.tacotron2.encoder import Encoder, CharacterEncoder
 from espnet.nets.tts_interface import TTSInterface
 from espnet.utils.cli_utils import strtobool
 from espnet.utils.fill_missing_args import fill_missing_args
@@ -161,6 +161,37 @@ class GuidedAttentionLoss(torch.nn.Module):
         in_masks = make_non_pad_mask(ilens)  # (B, T_in)
         out_masks = make_non_pad_mask(olens)  # (B, T_out)
         return out_masks.unsqueeze(-1) & in_masks.unsqueeze(-2)  # (B, T_out, T_in)
+
+
+class IntoTypeLoss(torch.nn.Module):
+    """Loss function module for intonation type classification"""
+    def __init__(
+            self,
+            into_type_num=3,
+            into_statement_weight=1.0,
+            into_normal_weight=10.0,
+            into_unmarked_weight=10.0,
+            loss_weight = 0.2,
+    ):
+        super(IntoTypeLoss, self).__init__()
+        assert into_type_num == 2 or into_type_num == 3
+        self.into_type_num = into_type_num
+        self.into_statement_weight = into_statement_weight
+        self.into_normal_weight = into_normal_weight
+        self.into_unmarked_weight = into_unmarked_weight
+        self.loss_weight = torch.tensor(loss_weight)
+        
+        self.loss = torch.nn.CrossEntropyLoss(
+            weight=torch.tensor([into_statement_weight, into_normal_weight, into_unmarked_weight])
+        )
+
+    def forward(self, logits, labels):
+        """
+            logits: (B, C) real-valued logits before softmax,
+                     if C > 2
+            labels: (B) integer labels of each example, ranging from 0 to C-1
+        """
+        return self.loss(logits, labels) * self.loss_weight
 
 
 class Tacotron2Loss(torch.nn.Module):
@@ -471,6 +502,12 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             help="Number of speaker embedding dimensions",
         )
         group.add_argument(
+            "--char-embed-dim",
+            default=None,
+            type=int,
+            help="Number of character embedding dimensions",
+        )
+        group.add_argument(
             "--spc-dim", default=None, type=int, help="Number of spectrogram dimensions"
         )
         group.add_argument(
@@ -587,10 +624,12 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         self.odim = odim
         self.spk_embed_dim = args.spk_embed_dim
         self.char_embed_dim = args.char_embed_dim
+        self.into_embed_dim = args.into_embed_dim
         self.cumulate_att_w = args.cumulate_att_w
         self.reduction_factor = args.reduction_factor
         self.use_cbhg = args.use_cbhg
         self.use_guided_attn_loss = args.use_guided_attn_loss
+        self.use_intotype_loss = args.use_intotype_loss
 
         # define activation function for the final output
         if args.output_activation is None:
@@ -620,29 +659,42 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             padding_idx=padding_idx,
         )
         if args.char_embed_dim is not None:
-            self.ch_enc = Encoder(
+            # self.ch_enc = Encoder(
+            #     idim=args.char_embed_dim,
+            #     input_layer="linear",
+            #     embed_dim=0,
+            #     elayers=args.elayers,
+            #     eunits=args.eunits,
+            #     econv_layers=args.econv_layers,
+            #     econv_chans=args.econv_chans,
+            #     econv_filts=args.econv_filts,
+            #     use_batch_norm=args.use_batch_norm,
+            #     use_residual=args.use_residual,
+            #     dropout_rate=args.dropout_rate,
+            #     padding_idx=padding_idx,
+            # )
+            self.ch_enc = CharacterEncoder(
                 idim=args.char_embed_dim,
-                input_layer="linear",
-                embed_dim=0,
+                pred_into_type=args.use_intotype_loss,
+                into_type_num=args.into_type_num,
                 elayers=args.elayers,
                 eunits=args.eunits,
-                econv_layers=args.econv_layers,
-                econv_chans=args.econv_chans,
-                econv_filts=args.econv_filts,
-                use_batch_norm=args.use_batch_norm,
-                use_residual=args.use_residual,
-                dropout_rate=args.dropout_rate,
+            )
+        if args.into_embed_dim is not None:
+            self.into_embed = self.embed = torch.nn.Embedding(
+                args.into_type_num,
+                args.into_embed_dim,
                 padding_idx=padding_idx,
             )
-        dec_idim = (
-            args.eunits * 2 + args.spk_embed_dim
-            if args.char_embed_dim and args.spk_embed_dim
-            else args.eunits + args.spk_embed_dim
-            if args.spk_embed_dim
-            else args.eunits * 2
-            if args.char_embed_dim
-            else args.eunits
-        )
+
+        dec_idim = args.eunits
+        if args.spk_embed_dim:
+            dec_idim += args.spk_embed_dim
+        if args.char_embed_dim:
+            dec_idim += args.eunits
+        if args.into_embed_dim:
+            dec_idim += args.into_embed_dim
+
         if args.atype == "location":
             att = AttLoc(
                 dec_idim, args.dunits, args.adim, args.aconv_chans, args.aconv_filts
@@ -701,6 +753,16 @@ class Tacotron2(TTSInterface, torch.nn.Module):
                 sigma=args.guided_attn_loss_sigma,
                 alpha=args.guided_attn_loss_lambda,
             )
+        if self.use_intotype_loss:
+            ## TODO: Consider the case of 3 types and modify the projection
+            # self.type_proj = torch.nn.Linear(
+            #     in_features=args.eunits,
+            #     out_features=1
+            # )
+            self.intotype_loss = IntoTypeLoss(
+                args.into_type_num,
+            )
+
         if self.use_cbhg:
             self.cbhg = CBHG(
                 idim=odim,
@@ -754,8 +816,12 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             hs = torch.cat([hs, spembs], dim=-1)
 
         if self.char_embed_dim is not None:
-            ch_hs, _ = self.ch_enc(chembs, ilens)
+            ch_hs, _, type_logits = self.ch_enc(chembs, ilens)
             hs = torch.cat([hs, ch_hs], dim=-1)
+
+        if self.into_embed_dim is not None:
+            itembs = self.into_embed(intotypes).unsqueeze(1).expand(-1, hs.size(1), -1)
+            hs = torch.cat([hs, itembs], dim=-1)
         
         after_outs, before_outs, logits, att_ws = self.dec(hs, hlens, ys)
 
@@ -790,6 +856,14 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             loss = loss + attn_loss
             report_keys += [
                 {"attn_loss": attn_loss.item()},
+            ]
+
+        if self.use_intotype_loss:
+            type_logits = type_logits.squeeze(-1)
+            it_loss = self.intotype_loss(type_logits, intotypes)
+            loss = loss + it_loss
+            report_keys += [
+                {"intonation_type_loss": it_loss.item()}
             ]
 
         # caluculate cbhg loss
@@ -844,6 +918,12 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         if self.spk_embed_dim is not None:
             spemb = F.normalize(spemb, dim=0).unsqueeze(0).expand(h.size(0), -1)
             h = torch.cat([h, spemb], dim=-1)
+        if self.char_embed_dim is not None:
+            ch_h = self.ch_enc.inference(chemb)
+            h = torch.cat([h, ch_h], dim=-1)
+        if self.into_embed_dim:
+            itemb = self.into_embed(intotype).unsqueeze(0).expand(h.size(0), -1)
+            h = torch.cat([h, itemb], dim=-1)
         outs, probs, att_ws = self.dec.inference(
             h,
             threshold,
@@ -889,8 +969,11 @@ class Tacotron2(TTSInterface, torch.nn.Module):
                 spembs = F.normalize(spembs).unsqueeze(1).expand(-1, hs.size(1), -1)
                 hs = torch.cat([hs, spembs], dim=-1)
             if self.char_embed_dim is not None:
-                ch_hs, _ = self.ch_enc(chembs, ilens)
+                ch_hs, _, type_logits = self.ch_enc(chembs, ilens)
                 hs = torch.cat([hs, ch_hs], dim=-1)
+            if self.into_embed_dim is not None:
+                itembs = self.into_embed(intotypes).unsqueeze(1).expand(-1, hs.size(1), -1)
+                hs = torch.cat([hs, itembs], dim=-1)
             att_ws = self.dec.calculate_all_attentions(hs, hlens, ys)
         self.train()
 

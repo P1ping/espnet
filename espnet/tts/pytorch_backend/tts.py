@@ -21,6 +21,8 @@ import torch
 from chainer import training
 from chainer.training import extensions
 
+from torch.nn.parallel import DistributedDataParallel
+
 from espnet.asr.asr_utils import get_model_conf
 from espnet.asr.asr_utils import snapshot_object
 from espnet.asr.asr_utils import torch_load
@@ -108,7 +110,8 @@ class CustomEvaluator(BaseEvaluator):
 class CustomUpdater(training.StandardUpdater):
     """Custom updater."""
 
-    def __init__(self, model, grad_clip, iterator, optimizer, device, accum_grad=1):
+    def __init__(self, model, grad_clip, iterator, optimizer, device,
+                accum_grad=1, local_rank=None):
         """Initilize module.
 
         Args:
@@ -126,6 +129,7 @@ class CustomUpdater(training.StandardUpdater):
         self.clip_grad_norm = torch.nn.utils.clip_grad_norm_
         self.accum_grad = accum_grad
         self.forward_count = 0
+        self.local_rank = local_rank
 
     # The core part of the update routine can be customized by overriding.
     def update_core(self):
@@ -299,11 +303,27 @@ def train(args):
         args.spc_dim = int(valid_json[utts[0]]["input"][1]["shape"][1])
     else:
         args.spc_dim = None
+
     if args.use_character_embedding:
         logging.info("\nUsing character embeddings? Hahah!\n")
         args.char_embed_dim = 768
     else:
         args.char_embed_dim = None
+
+    # Manually set the number of intonation types
+    args.into_type_num = 3
+
+    if args.into_embed_dim is not None:
+        if args.into_embed_dim <= 0:
+            args.into_embed_dim = None
+        elif not args.use_intonation_type:
+            raise ValueError("use_intonation_type should be true when into_embed_dim is given.")
+
+    if args.use_intotype_loss:
+        if not args.use_intonation_type:
+            raise ValueError("use_intonation_type should be true when use_intotype_loss is true.")
+        if not args.use_character_embedding:
+            raise ValueError("use_character_embedding should be true when use_intotype_loss is true.")
 
     # write model config
     if not os.path.exists(args.outdir):
@@ -331,17 +351,22 @@ def train(args):
 
     # check the use of multi-gpu
     if args.ngpu > 1:
-        model = torch.nn.DataParallel(model, device_ids=list(range(args.ngpu)))
+        # model = torch.nn.DataParallel(model, device_ids=list(range(args.ngpu)))
         if args.batch_size != 0:
             logging.warning(
                 "batch size is automatically increased (%d -> %d)"
                 % (args.batch_size, args.batch_size * args.ngpu)
             )
-            args.batch_size *= args.ngpu
+            # args.batch_size *= args.ngpu
 
     # set torch device
-    device = torch.device("cuda" if args.ngpu > 0 else "cpu")
+    # device = torch.device("cuda" if args.ngpu > 0 else "cpu")
+    device = torch.device("cuda", args.local_rank)
     model = model.to(device)
+    model = DistributedDataParallel(model, 
+                device_ids=[args.local_rank],
+                output_device=args.local_rank,
+            )
 
     # freeze modules, if specified
     if args.freeze_mods:
@@ -448,15 +473,18 @@ def train(args):
     converter = CustomConverter()
     # hack to make batchsize argument as 1
     # actual bathsize is included in a list
+    train_dataset = TransformDataset(
+                train_batchset, lambda data: converter([load_tr(data)])
+            )
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     train_iter = {
         "main": ChainerDataLoader(
-            dataset=TransformDataset(
-                train_batchset, lambda data: converter([load_tr(data)])
-            ),
+            dataset=train_dataset,
             batch_size=1,
-            num_workers=args.num_iter_processes,
-            shuffle=not use_sortagrad,
+            # num_workers=args.num_iter_processes,
+            # shuffle=not use_sortagrad,
             collate_fn=lambda x: x[0],
+            sampler=train_sampler,
         )
     }
     valid_iter = {
@@ -473,7 +501,8 @@ def train(args):
 
     # Set up a trainer
     updater = CustomUpdater(
-        model, args.grad_clip, train_iter, optimizer, device, args.accum_grad
+        model, args.grad_clip, train_iter, optimizer, device, args.accum_grad,
+        local_rank=args.local_rank,
     )
     trainer = training.Trainer(updater, (args.epochs, "epoch"), out=args.outdir)
 
@@ -482,88 +511,93 @@ def train(args):
         logging.info("resumed from %s" % args.resume)
         torch_resume(args.resume, trainer)
 
-    # set intervals
-    eval_interval = (args.eval_interval_epochs, "epoch")
-    save_interval = (args.save_interval_epochs, "epoch")
-    report_interval = (args.report_interval_iters, "iteration")
+    # Only the major device would evaluate and report
+    if args.local_rank == 0:
+        # set intervals
+        eval_interval = (args.eval_interval_epochs, "epoch")
+        save_interval = (args.save_interval_epochs, "epoch")
+        report_interval = (args.report_interval_iters, "iteration")
 
-    # Evaluate the model with the test dataset for each epoch
-    trainer.extend(
-        CustomEvaluator(model, valid_iter, reporter, device), trigger=eval_interval
-    )
-
-    # Save snapshot for each epoch
-    trainer.extend(torch_snapshot(), trigger=save_interval)
-
-    # Save best models
-    trainer.extend(
-        snapshot_object(model, "model.loss.best"),
-        trigger=training.triggers.MinValueTrigger(
-            "validation/main/loss", trigger=eval_interval
-        ),
-    )
-
-    # Save attention figure for each epoch
-    if args.num_save_attention > 0:
-        data = sorted(
-            list(valid_json.items())[: args.num_save_attention],
-            key=lambda x: int(x[1]["output"][0]["shape"][0]),
-        )
-        if hasattr(model, "module"):
-            att_vis_fn = model.module.calculate_all_attentions
-            plot_class = model.module.attention_plot_class
-            reduction_factor = model.module.reduction_factor
-        else:
-            att_vis_fn = model.calculate_all_attentions
-            plot_class = model.attention_plot_class
-            reduction_factor = model.reduction_factor
-        if reduction_factor > 1:
-            # fix the length to crop attention weight plot correctly
-            data = copy.deepcopy(data)
-            for idx in range(len(data)):
-                ilen = data[idx][1]["input"][0]["shape"][0]
-                data[idx][1]["input"][0]["shape"][0] = ilen // reduction_factor
-        att_reporter = plot_class(
-            att_vis_fn,
-            data,
-            args.outdir + "/att_ws",
-            converter=converter,
-            transform=load_cv,
-            device=device,
-            reverse=True,
-        )
-        trainer.extend(att_reporter, trigger=eval_interval)
-    else:
-        att_reporter = None
-
-    # Make a plot for training and validation values
-    if hasattr(model, "module"):
-        base_plot_keys = model.module.base_plot_keys
-    else:
-        base_plot_keys = model.base_plot_keys
-    plot_keys = []
-    for key in base_plot_keys:
-        plot_key = ["main/" + key, "validation/main/" + key]
+        # Evaluate the model with the test dataset for each epoch
         trainer.extend(
-            extensions.PlotReport(plot_key, "epoch", file_name=key + ".png"),
+            CustomEvaluator(model, valid_iter, reporter, device), trigger=eval_interval
+        )
+
+        # Save snapshot for each epoch
+        trainer.extend(torch_snapshot(), trigger=save_interval)
+
+        # Save best models
+        trainer.extend(
+            snapshot_object(model, "model.loss.best"),
+            trigger=training.triggers.MinValueTrigger(
+                "validation/main/loss", trigger=eval_interval
+            ),
+        )
+
+        # Save attention figure for each epoch
+        if args.num_save_attention > 0:
+            data = sorted(
+                list(valid_json.items())[: args.num_save_attention],
+                key=lambda x: int(x[1]["output"][0]["shape"][0]),
+            )
+            if hasattr(model, "module"):
+                att_vis_fn = model.module.calculate_all_attentions
+                plot_class = model.module.attention_plot_class
+                reduction_factor = model.module.reduction_factor
+            else:
+                att_vis_fn = model.calculate_all_attentions
+                plot_class = model.attention_plot_class
+                reduction_factor = model.reduction_factor
+            if reduction_factor > 1:
+                # fix the length to crop attention weight plot correctly
+                data = copy.deepcopy(data)
+                for idx in range(len(data)):
+                    ilen = data[idx][1]["input"][0]["shape"][0]
+                    data[idx][1]["input"][0]["shape"][0] = ilen // reduction_factor
+            att_reporter = plot_class(
+                att_vis_fn,
+                data,
+                args.outdir + "/att_ws",
+                converter=converter,
+                transform=load_cv,
+                device=device,
+                reverse=True,
+            )
+            trainer.extend(att_reporter, trigger=eval_interval)
+        else:
+            att_reporter = None
+
+        # Make a plot for training and validation values
+        if hasattr(model, "module"):
+            base_plot_keys = model.module.base_plot_keys
+        else:
+            base_plot_keys = model.base_plot_keys
+        plot_keys = []
+        for key in base_plot_keys:
+            plot_key = ["main/" + key, "validation/main/" + key]
+            trainer.extend(
+                extensions.PlotReport(plot_key, "epoch", file_name=key + ".png"),
+                trigger=eval_interval,
+            )
+            plot_keys += plot_key
+        trainer.extend(
+            extensions.PlotReport(plot_keys, "epoch", file_name="all_loss.png"),
             trigger=eval_interval,
         )
-        plot_keys += plot_key
-    trainer.extend(
-        extensions.PlotReport(plot_keys, "epoch", file_name="all_loss.png"),
-        trigger=eval_interval,
-    )
 
-    # Write a log of evaluation statistics for each epoch
-    trainer.extend(extensions.LogReport(trigger=report_interval))
-    report_keys = ["epoch", "iteration", "elapsed_time"] + plot_keys
-    trainer.extend(extensions.PrintReport(report_keys), trigger=report_interval)
-    trainer.extend(extensions.ProgressBar(), trigger=report_interval)
+        # Write a log of evaluation statistics for each epoch
+        trainer.extend(extensions.LogReport(trigger=report_interval))
+        report_keys = ["epoch", "iteration", "elapsed_time"] + plot_keys
+        trainer.extend(extensions.PrintReport(report_keys), trigger=report_interval)
+        trainer.extend(extensions.ProgressBar(), trigger=report_interval)
 
     set_early_stop(trainer, args)
-    if args.tensorboard_dir is not None and args.tensorboard_dir != "":
-        writer = SummaryWriter(args.tensorboard_dir)
-        trainer.extend(TensorboardLogger(writer, att_reporter), trigger=report_interval)
+
+    # Again, only the major device would report
+    if args.local_rank == 0:
+        if args.tensorboard_dir is not None and args.tensorboard_dir != "":
+            writer = SummaryWriter(args.tensorboard_dir)
+            trainer.extend(TensorboardLogger(writer, att_reporter), trigger=report_interval)
 
     if use_sortagrad:
         trainer.extend(
@@ -616,6 +650,8 @@ def decode(args):
         load_input=False,
         sort_in_input_length=False,
         use_speaker_embedding=train_args.use_speaker_embedding,
+        use_character_embedding=train_args.use_character_embedding,
+        use_intonation_type=train_args.use_intonation_type,
         preprocess_conf=train_args.preprocess_conf
         if args.preprocess_conf is None
         else args.preprocess_conf,
@@ -714,12 +750,27 @@ def decode(args):
         data = load_inputs_and_targets(batch)
         x = torch.LongTensor(data[0][0]).to(device)
         spemb = None
+        chemb = None
+        intotype = None
+
+        ## TODO: Add loading of intonation types
         if train_args.use_speaker_embedding:
             spemb = torch.FloatTensor(data[1][0]).to(device)
+            if train_args.use_character_embedding:
+                chemb = torch.FloatTensor(data[2][0]).to(device)
+            if train_args.use_intonation_type:
+                intotype = torch.LongTensor(data[3][0]).to(device)
+        else:
+            if train_args.use_character_embedding:
+                chemb = torch.FloatTensor(data[1][0]).to(device)
+            if train_args.use_intonation_type:
+                intotype = torch.LongTensor(data[2][0]).to(device)
 
         # decode and write
         start_time = time.time()
-        outs, probs, att_ws = model.inference(x, args, spemb=spemb)
+        outs, probs, att_ws = model.inference(x, args,
+            spemb=spemb, chemb=chemb, intotype=intotype
+        )
         logging.info(
             "inference speed = %.1f frames / sec."
             % (int(outs.size(0)) / (time.time() - start_time))

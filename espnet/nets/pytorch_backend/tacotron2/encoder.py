@@ -174,3 +174,149 @@ class Encoder(torch.nn.Module):
         ilens = torch.tensor([x.size(0)])
 
         return self.forward(xs, ilens)[0][0]
+
+
+class CharacterEncoder(torch.nn.Module):
+    def __init__(
+        self,
+        idim,
+        pred_into_type,
+        into_type_num,
+        elayers=1,
+        eunits=512,
+        econv_layers=3,
+        econv_filts=9,
+        use_batch_norm=True,
+        use_residual=False,
+        dropout_rate=0.2,
+        padding_idx=0,
+    ):
+        super(CharacterEncoder, self).__init__()
+        # store the hyperparameters
+        self.idim = idim
+        self.use_residual = use_residual
+
+        econv_chans = eunits
+        # define network layer modules
+        self.embed = torch.nn.Linear(idim, econv_chans)
+
+        if econv_layers > 0:
+            self.convs = torch.nn.ModuleList()
+            for layer in six.moves.range(econv_layers):
+                ichans = econv_chans
+                if use_batch_norm:
+                    self.convs += [
+                        torch.nn.Sequential(
+                            torch.nn.Conv1d(
+                                ichans,
+                                econv_chans,
+                                econv_filts,
+                                stride=1,
+                                padding=(econv_filts - 1) // 2,
+                                bias=False,
+                            ),
+                            torch.nn.BatchNorm1d(econv_chans),
+                            torch.nn.ReLU(),
+                            torch.nn.Dropout(dropout_rate),
+                        )
+                    ]
+                else:
+                    self.convs += [
+                        torch.nn.Sequential(
+                            torch.nn.Conv1d(
+                                ichans,
+                                econv_chans,
+                                econv_filts,
+                                stride=1,
+                                padding=(econv_filts - 1) // 2,
+                                bias=False,
+                            ),
+                            torch.nn.ReLU(),
+                            torch.nn.Dropout(dropout_rate),
+                        )
+                    ]
+        else:
+            self.convs = None
+        if elayers > 0:
+            iunits = econv_chans if econv_layers != 0 else embed_dim
+            self.blstm = torch.nn.LSTM(
+                iunits, eunits // 2, elayers, batch_first=True, bidirectional=True
+            )
+        else:
+            self.blstm = None
+
+        # self.pred_into_type = pred_into_type
+        # self.into_type_num = into_type_num
+        if pred_into_type:
+            self.pred_prj = torch.nn.Linear(
+                in_features=eunits*2,
+                out_features=into_type_num
+            )
+        else:
+            self.pred_prj = None
+
+        # initialize
+        self.apply(encoder_init)
+
+    def forward(self, xs, ilens=None, intotypes=None):
+        xs = self.embed(xs).transpose(1, 2)
+        if self.convs is not None:
+            for i in six.moves.range(len(self.convs)):
+                if self.use_residual:
+                    xs += self.convs[i](xs)
+                else:
+                    xs = self.convs[i](xs)
+
+        xs_old = xs.transpose(1, 2)
+
+        if self.blstm is None:
+            return xs_old
+        if not isinstance(ilens, torch.Tensor):
+            ilens = torch.tensor(ilens)
+        xs = pack_padded_sequence(xs_old, ilens.cpu(), batch_first=True)
+        self.blstm.flatten_parameters()
+        xs, _ = self.blstm(xs)  # (B, Tmax, C)
+        xs, hlens = pad_packed_sequence(xs, batch_first=True)
+
+        xs_new = xs + xs_old
+
+        if self.pred_prj is None:
+            return xs_new, hlens, None
+
+        # Predict sentence type
+        first_inputs = xs[:, 0, :]
+        last_inputs = []
+        for i in range(xs.shape[0]):
+            idx = ilens[i] - 1
+            last_inputs.append(xs[i, idx, :])
+        last_inputs = torch.stack(last_inputs)
+        inputs = torch.cat([first_inputs, last_inputs], dim=-1)
+        logits = self.pred_prj(inputs)
+        return xs_new, hlens, logits
+
+    def inference(self, x):
+        xs = x.unsqueeze(0)
+        ilens = torch.tensor([x.size(0)])
+
+        xs = self.embed(xs).transpose(1, 2)
+        if self.convs is not None:
+            for i in six.moves.range(len(self.convs)):
+                if self.use_residual:
+                    xs += self.convs[i](xs)
+                else:
+                    xs = self.convs[i](xs)
+        
+        xs_old = xs.transpose(1, 2)
+
+        if self.blstm is None:
+            return xs_old
+        if not isinstance(ilens, torch.Tensor):
+            ilens = torch.tensor(ilens)
+        xs = pack_padded_sequence(xs_old, ilens.cpu(), batch_first=True)
+        self.blstm.flatten_parameters()
+        xs, _ = self.blstm(xs)  # (B, Tmax, C)
+        xs, hlens = pad_packed_sequence(xs, batch_first=True)
+
+        xs_new = xs + xs_old
+
+        return xs_new[0]
