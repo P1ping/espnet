@@ -170,7 +170,7 @@ class IntoTypeLoss(torch.nn.Module):
             into_type_num=3,
             into_statement_weight=1.0,
             into_normal_weight=10.0,
-            into_unmarked_weight=10.0,
+            into_unmarked_weight=20.0,
             loss_weight = 0.2,
     ):
         super(IntoTypeLoss, self).__init__()
@@ -179,16 +179,15 @@ class IntoTypeLoss(torch.nn.Module):
         self.into_statement_weight = into_statement_weight
         self.into_normal_weight = into_normal_weight
         self.into_unmarked_weight = into_unmarked_weight
+
         self.loss_weight = torch.tensor(loss_weight)
-        
         self.loss = torch.nn.CrossEntropyLoss(
             weight=torch.tensor([into_statement_weight, into_normal_weight, into_unmarked_weight])
         )
 
     def forward(self, logits, labels):
         """
-            logits: (B, C) real-valued logits before softmax,
-                     if C > 2
+            logits: (B, C) real-valued logits before softmax
             labels: (B) integer labels of each example, ranging from 0 to C-1
         """
         return self.loss(logits, labels) * self.loss_weight
@@ -645,6 +644,9 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         padding_idx = 0
 
         # define network modules
+        enc_extra_dim = 0
+        if args.char_embed_dim is not None and args.character_embedding_position in ['encoder', 'both']:
+            enc_extra_dim = args.eunits
         self.enc = Encoder(
             idim=idim,
             embed_dim=args.embed_dim,
@@ -657,29 +659,50 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             use_residual=args.use_residual,
             dropout_rate=args.dropout_rate,
             padding_idx=padding_idx,
+            extra_dim=enc_extra_dim,
         )
+        self.pre_enc = None
+        self.ch_enc = None
         if args.char_embed_dim is not None:
-            # self.ch_enc = Encoder(
-            #     idim=args.char_embed_dim,
-            #     input_layer="linear",
-            #     embed_dim=0,
-            #     elayers=args.elayers,
-            #     eunits=args.eunits,
-            #     econv_layers=args.econv_layers,
-            #     econv_chans=args.econv_chans,
-            #     econv_filts=args.econv_filts,
-            #     use_batch_norm=args.use_batch_norm,
-            #     use_residual=args.use_residual,
-            #     dropout_rate=args.dropout_rate,
-            #     padding_idx=padding_idx,
-            # )
-            self.ch_enc = CharacterEncoder(
-                idim=args.char_embed_dim,
-                pred_into_type=args.use_intotype_loss,
-                into_type_num=args.into_type_num,
-                elayers=args.elayers,
-                eunits=args.eunits,
-            )
+            if args.character_embedding_position == 'encoder':
+                self.pre_enc = CharacterEncoder(
+                    idim=args.char_embed_dim,
+                    pred_into_type=args.use_intotype_loss,
+                    into_type_num=args.into_type_num,
+                    reduce_character_embedding=args.reduce_character_embedding,
+                    elayers=args.elayers,
+                    eunits=args.eunits,
+                )
+            elif args.character_embedding_position == 'decoder':
+                self.ch_enc = CharacterEncoder(
+                    idim=args.char_embed_dim,
+                    pred_into_type=args.use_intotype_loss,
+                    into_type_num=args.into_type_num,
+                    reduce_character_embedding=args.reduce_character_embedding,
+                    elayers=args.elayers,
+                    eunits=args.eunits,
+                )
+            elif args.character_embedding_position == 'both':
+                self.pre_enc = CharacterEncoder(
+                    idim=args.char_embed_dim,
+                    pred_into_type=args.use_intotype_loss,
+                    into_type_num=args.into_type_num,
+                    reduce_character_embedding=args.reduce_character_embedding,
+                    elayers=args.elayers,
+                    eunits=args.eunits,
+                )
+                self.ch_enc = CharacterEncoder(
+                    idim=args.char_embed_dim,
+                    pred_into_type=False,
+                    into_type_num=0,
+                    reduce_character_embedding=False,
+                    elayers=args.elayers,
+                    eunits=args.eunits,
+                )
+            else:
+                raise ValueError("Invalid character embedding position \"%s\""
+                    % args.character_embedding_position
+                )
         if args.into_embed_dim is not None:
             self.into_embed = self.embed = torch.nn.Embedding(
                 args.into_type_num,
@@ -690,7 +713,7 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         dec_idim = args.eunits
         if args.spk_embed_dim:
             dec_idim += args.spk_embed_dim
-        if args.char_embed_dim:
+        if self.ch_enc is not None:
             dec_idim += args.eunits
         if args.into_embed_dim:
             dec_idim += args.into_embed_dim
@@ -754,11 +777,6 @@ class Tacotron2(TTSInterface, torch.nn.Module):
                 alpha=args.guided_attn_loss_lambda,
             )
         if self.use_intotype_loss:
-            ## TODO: Consider the case of 3 types and modify the projection
-            # self.type_proj = torch.nn.Linear(
-            #     in_features=args.eunits,
-            #     out_features=1
-            # )
             self.intotype_loss = IntoTypeLoss(
                 args.into_type_num,
             )
@@ -810,13 +828,17 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             labels = labels[:, :max_out]
 
         # calculate tacotron2 outputs
-        hs, hlens = self.enc(xs, ilens)
+        pre_xs = None
+        if self.pre_enc is not None:
+            pre_xs, _, pre_type_logits = self.pre_enc(chembs, ilens)
+
+        hs, hlens = self.enc(xs, ilens, pre_xs)
         if self.spk_embed_dim is not None:
             spembs = F.normalize(spembs).unsqueeze(1).expand(-1, hs.size(1), -1)
             hs = torch.cat([hs, spembs], dim=-1)
 
-        if self.char_embed_dim is not None:
-            ch_hs, _, type_logits = self.ch_enc(chembs, ilens)
+        if self.ch_enc is not None:
+            ch_hs, _, ch_type_logits = self.ch_enc(chembs, ilens)
             hs = torch.cat([hs, ch_hs], dim=-1)
 
         if self.into_embed_dim is not None:
@@ -859,7 +881,7 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             ]
 
         if self.use_intotype_loss:
-            type_logits = type_logits.squeeze(-1)
+            type_logits = pre_type_logits if self.pre_enc is not None else ch_type_logits
             it_loss = self.intotype_loss(type_logits, intotypes)
             loss = loss + it_loss
             report_keys += [
@@ -914,12 +936,27 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         forward_window = inference_args.forward_window if use_att_constraint else 0
 
         # inference
-        h = self.enc.inference(x)
+        pre_x = None
+        if self.pre_enc is not None:
+            pre_x, pre_type_logit = self.pre_enc.inference(chemb)
+            # To print prediction of intonation types
+            if pre_type_logit is not None:
+                pre_type_logit = pre_type_logit.data.cpu().numpy()
+                print(pre_type_logit)
+                print(pre_type_logit.argmax())
+            # ============
+        h = self.enc.inference(x, pre_x)
         if self.spk_embed_dim is not None:
             spemb = F.normalize(spemb, dim=0).unsqueeze(0).expand(h.size(0), -1)
             h = torch.cat([h, spemb], dim=-1)
-        if self.char_embed_dim is not None:
-            ch_h = self.ch_enc.inference(chemb)
+        if self.ch_enc is not None:
+            ch_h, ch_type_logit = self.ch_enc.inference(chemb)
+            # To print prediction of intonation types
+            if ch_type_logit is not None:
+                ch_type_logit = ch_type_logit.data.cpu().numpy()
+                print(ch_type_logit)
+                print(ch_type_logit.argmax())
+            # ============
             h = torch.cat([h, ch_h], dim=-1)
         if self.into_embed_dim:
             itemb = self.into_embed(intotype).unsqueeze(0).expand(h.size(0), -1)
@@ -935,10 +972,13 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         )
 
         if self.use_cbhg:
-            cbhg_outs = self.cbhg.inference(outs)
-            return cbhg_outs, probs, att_ws
-        else:
-            return outs, probs, att_ws
+            outs = self.cbhg.inference(outs)
+        return outs, probs, att_ws
+        # if self.use_cbhg:
+        #     cbhg_outs = self.cbhg.inference(outs)
+        #     return cbhg_outs, probs, att_ws
+        # else:
+        #     return outs, probs, att_ws
 
     def calculate_all_attentions(
         self, xs, ilens, ys, chembs=None, intotypes=None, spembs=None, keep_tensor=False, *args, **kwargs
@@ -964,12 +1004,15 @@ class Tacotron2(TTSInterface, torch.nn.Module):
 
         self.eval()
         with torch.no_grad():
-            hs, hlens = self.enc(xs, ilens)
+            pre_xs = None
+            if self.pre_enc is not None:
+                pre_xs, _, pre_type_logits = self.pre_enc(chembs, ilens)
+            hs, hlens = self.enc(xs, ilens, pre_xs)
             if self.spk_embed_dim is not None:
                 spembs = F.normalize(spembs).unsqueeze(1).expand(-1, hs.size(1), -1)
                 hs = torch.cat([hs, spembs], dim=-1)
-            if self.char_embed_dim is not None:
-                ch_hs, _, type_logits = self.ch_enc(chembs, ilens)
+            if self.ch_enc is not None:
+                ch_hs, _, ch_type_logits = self.ch_enc(chembs, ilens)
                 hs = torch.cat([hs, ch_hs], dim=-1)
             if self.into_embed_dim is not None:
                 itembs = self.into_embed(intotypes).unsqueeze(1).expand(-1, hs.size(1), -1)
@@ -1002,3 +1045,36 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         if self.use_cbhg:
             plot_keys += ["cbhg_l1_loss", "cbhg_mse_loss"]
         return plot_keys
+
+    def gta_inference(
+        self, xs, ilens, ys, labels, olens, chembs=None, intotypes=None, spembs=None, extras=None, *args, **kwargs
+    ):
+        max_in = max(ilens)
+        max_out = max(olens)
+        if max_in != xs.shape[1]:
+            xs = xs[:, :max_in]
+        if max_out != ys.shape[1]:
+            ys = ys[:, :max_out]
+            labels = labels[:, :max_out]
+
+        # calculate tacotron2 outputs
+        pre_xs = None
+        if self.pre_enc is not None:
+            pre_xs, _, pre_type_logits = self.pre_enc(chembs, ilens)
+
+        hs, hlens = self.enc(xs, ilens, pre_xs)
+        if self.spk_embed_dim is not None:
+            spembs = F.normalize(spembs).unsqueeze(1).expand(-1, hs.size(1), -1)
+            hs = torch.cat([hs, spembs], dim=-1)
+
+        if self.ch_enc is not None:
+            ch_hs, _, ch_type_logits = self.ch_enc(chembs, ilens)
+            hs = torch.cat([hs, ch_hs], dim=-1)
+
+        if self.into_embed_dim is not None:
+            itembs = self.into_embed(intotypes).unsqueeze(1).expand(-1, hs.size(1), -1)
+            hs = torch.cat([hs, itembs], dim=-1)
+        
+        after_outs, before_outs, logits, att_ws = self.dec(hs, hlens, ys)
+
+        return after_outs

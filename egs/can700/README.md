@@ -1,29 +1,19 @@
 tts1-vanilla:
-	Pure Cantonese data
-        LJ_MBMG CMVN
-	vanilla Tacotron
-	(Data also used for vocoder training)
-tts1-vanilla-canttscmvn
-	Pure Cantonese data
-	CANTTS CMVN
+	can-data
 	vanilla Tacotron
 tts2-mixing:
-	Code-mixing Cantonese data + LJSpeech data (half number)
-	LJ_MBMG CMVN
+	can-lj-data
 	Tacotron + speaker embeddings (256-dim)
 tts3-charembed:
-	Pure Cantonese data
-	X
+	can-data
 	Tacotron + character embeddings (768-dim)
 	(To be trained)
 tts4-intoembed:
-	Pure Cantonese data
-	X
+	can-data
 	Tacotron + intonation embeddings (256-dim)
 	(To be trained)
 tts5-intolearn:
-	Pure Cantonese data
-	X
+	can-data
 	Tacotron + character embeddings + type loss
 	(To be designed)
 	(To be trained)
@@ -33,12 +23,20 @@ cantts-data:
 	Code-mixing Cantonese data
         CANTTS CMVN
 	None
-cantts-lj-data:
-	Code-mixing Cantonese data + LJSpeech data(0.2 number)
+cantts-data-nopad:
+	Code-mixing Cantonese data without padding
 	CANTTS CMVN
 	None
-	(Data also used for vocoder training)
-tts1-vanilla-canttscmvn
-        Pure Cantonese data
+can-data:
+	Pure Cantonese data
+	CANTTS CMVN
+	None
+can-data-nopad:
+	Pure Cantonese data without padding
+	CANTTS CMVN
+	None
+cantts-lj-data:
+        Code-mixing Cantonese data + LJSpeech data(0.2 number)
         CANTTS CMVN
         None
+        (Data also used for vocoder training)

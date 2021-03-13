@@ -303,6 +303,19 @@ def get_parser():
         help="Whether to use character embedding",
     )
     parser.add_argument(
+        "--reduce-character-embedding",
+        default=False,
+        type=strtobool,
+        help="Whether to squeeze a sequence of character embeddings into a vector",
+    )
+    parser.add_argument(
+        "--character-embedding-position",
+        default='decoder',
+        choices=['encoder', 'decoder', 'both'],
+        type=str,
+        help="The position before which the output of character encoder is concatenated.",
+    )
+    parser.add_argument(
         "--use-intonation-type",
         default=False,
         type=strtobool,

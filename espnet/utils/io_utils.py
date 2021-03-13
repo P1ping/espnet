@@ -448,20 +448,23 @@ class LoadInputsAndTargets(object):
                 # return_batch = OrderedDict([(x_name, xs), (spembs_name, spembs)])
                 return_batch.update({spembs_name, spembs})
             
+            feat_ord = 1
             if self.use_character_embedding:
-                chembs = list(y_feats_dict.values())[1]
+                chembs = list(y_feats_dict.values())[feat_ord]
                 chembs = [chembs[i] for i in nonzero_sorted_idx]
                 chembs = [np.pad(chemb, ((0,1),(0,0)), 'constant', constant_values=0)
                     for chemb in chembs
                 ]
-                chembs_name = list(y_feats_dict.keys())[1]
+                chembs_name = list(y_feats_dict.keys())[feat_ord]
                 return_batch.update({chembs_name:chembs})
+                feat_ord += 1
 
             if self.use_intonation_type:
-                intotypes = list(y_feats_dict.values())[2]
+                intotypes = list(y_feats_dict.values())[feat_ord]
                 intotypes = [intotypes[i] for i in nonzero_sorted_idx]
-                intotypes_name = list(y_feats_dict.keys())[2]
+                intotypes_name = list(y_feats_dict.keys())[feat_ord]
                 return_batch.update({intotypes_name:intotypes})
+                feat_ord += 1
         return return_batch, uttid_list
 
     def _create_batch_vc(self, x_feats_dict, y_feats_dict, uttid_list):

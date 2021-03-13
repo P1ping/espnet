@@ -7,11 +7,14 @@
 """Tacotron2 encoder related modules."""
 
 import six
+import math
 
 import torch
 
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.nn.utils.rnn import pad_packed_sequence
+import torch.nn.functional as F
+from espnet.nets.pytorch_backend.nets_utils import make_pad_mask, to_device
 
 
 def encoder_init(m):
@@ -47,6 +50,7 @@ class Encoder(torch.nn.Module):
         use_residual=False,
         dropout_rate=0.5,
         padding_idx=0,
+        extra_dim=0,
     ):
         """Initialize Tacotron2 encoder module.
 
@@ -68,6 +72,8 @@ class Encoder(torch.nn.Module):
         # store the hyperparameters
         self.idim = idim
         self.use_residual = use_residual
+        self.extra_dim = extra_dim
+        assert extra_dim >= 0
 
         # define network layer modules
         if input_layer == "linear":
@@ -83,6 +89,8 @@ class Encoder(torch.nn.Module):
                 ichans = (
                     embed_dim if layer == 0 and input_layer == "embed" else econv_chans
                 )
+                if layer == 0:
+                    ichans += extra_dim
                 if use_batch_norm:
                     self.convs += [
                         torch.nn.Sequential(
@@ -127,7 +135,7 @@ class Encoder(torch.nn.Module):
         # initialize
         self.apply(encoder_init)
 
-    def forward(self, xs, ilens=None):
+    def forward(self, xs, ilens=None, extras=None):
         """Calculate forward propagation.
 
         Args:
@@ -141,7 +149,15 @@ class Encoder(torch.nn.Module):
             LongTensor: Batch of lengths of each sequence (B,)
 
         """
-        xs = self.embed(xs).transpose(1, 2)
+        xs = self.embed(xs)
+        if self.extra_dim > 0:
+            xs = torch.cat([xs, extras], dim=-1)
+        xs = xs.transpose(1, 2)
+
+        # xs = self.embed(xs).transpose(1, 2)
+        # if self.extra_dim > 0:
+        #     xs = torch.cat([xs, extras.transpose(1,2)], dim=1)
+
         if self.convs is not None:
             for i in six.moves.range(len(self.convs)):
                 if self.use_residual:
@@ -159,7 +175,7 @@ class Encoder(torch.nn.Module):
 
         return xs, hlens
 
-    def inference(self, x):
+    def inference(self, x, extra=None):
         """Inference.
 
         Args:
@@ -172,8 +188,9 @@ class Encoder(torch.nn.Module):
         """
         xs = x.unsqueeze(0)
         ilens = torch.tensor([x.size(0)])
+        extras = extra.unsqueeze(0) if extra is not None else None
 
-        return self.forward(xs, ilens)[0][0]
+        return self.forward(xs, ilens, extras)[0][0]
 
 
 class CharacterEncoder(torch.nn.Module):
@@ -182,6 +199,7 @@ class CharacterEncoder(torch.nn.Module):
         idim,
         pred_into_type,
         into_type_num,
+        reduce_character_embedding,
         elayers=1,
         eunits=512,
         econv_layers=3,
@@ -192,14 +210,12 @@ class CharacterEncoder(torch.nn.Module):
         padding_idx=0,
     ):
         super(CharacterEncoder, self).__init__()
-        # store the hyperparameters
+        
+        # Normal encoder modules
         self.idim = idim
         self.use_residual = use_residual
-
         econv_chans = eunits
-        # define network layer modules
         self.embed = torch.nn.Linear(idim, econv_chans)
-
         if econv_layers > 0:
             self.convs = torch.nn.ModuleList()
             for layer in six.moves.range(econv_layers):
@@ -245,20 +261,29 @@ class CharacterEncoder(torch.nn.Module):
         else:
             self.blstm = None
 
-        # self.pred_into_type = pred_into_type
-        # self.into_type_num = into_type_num
-        if pred_into_type:
-            self.pred_prj = torch.nn.Linear(
-                in_features=eunits*2,
-                out_features=into_type_num
+        # For reduction
+        self.reduce_character_embedding = reduce_character_embedding
+        self.query = None # For embedding reduction
+        if reduce_character_embedding or pred_into_type:
+            query = torch.nn.Parameter(
+                torch.FloatTensor((eunits)),
+                requires_grad=True
             )
-        else:
-            self.pred_prj = None
+            self.query = torch.nn.init.uniform_(query)
+            self.d_k = math.sqrt(eunits)
+            self.K = torch.nn.Linear(eunits, eunits)
+            self.V = torch.nn.Linear(eunits, eunits)
+            self.score_dropout = torch.nn.Dropout(p=dropout_rate)
+        
+        # For prediction
+        self.pred_prj = None
+        if pred_into_type:
+            self.pred_prj = torch.nn.Linear(eunits, into_type_num)
 
         # initialize
         self.apply(encoder_init)
 
-    def forward(self, xs, ilens=None, intotypes=None):
+    def forward(self, xs, ilens=None):
         xs = self.embed(xs).transpose(1, 2)
         if self.convs is not None:
             for i in six.moves.range(len(self.convs)):
@@ -267,7 +292,7 @@ class CharacterEncoder(torch.nn.Module):
                 else:
                     xs = self.convs[i](xs)
 
-        xs_old = xs.transpose(1, 2)
+        xs_old = xs.transpose(1, 2) # xs after convolution
 
         if self.blstm is None:
             return xs_old
@@ -278,45 +303,46 @@ class CharacterEncoder(torch.nn.Module):
         xs, _ = self.blstm(xs)  # (B, Tmax, C)
         xs, hlens = pad_packed_sequence(xs, batch_first=True)
 
-        xs_new = xs + xs_old
-
-        if self.pred_prj is None:
-            return xs_new, hlens, None
-
-        # Predict sentence type
-        first_inputs = xs[:, 0, :]
-        last_inputs = []
-        for i in range(xs.shape[0]):
-            idx = ilens[i] - 1
-            last_inputs.append(xs[i, idx, :])
-        last_inputs = torch.stack(last_inputs)
-        inputs = torch.cat([first_inputs, last_inputs], dim=-1)
-        logits = self.pred_prj(inputs)
-        return xs_new, hlens, logits
+        if self.query is None:
+            return xs, hlens, None
+        # # Predict sentence type
+        # first_inputs = xs[:, 0, :]
+        # last_inputs = []
+        # for i in range(xs.shape[0]):
+        #     idx = ilens[i] - 1
+        #     last_inputs.append(xs[i, idx, :])
+        # last_inputs = torch.stack(last_inputs)
+        # inputs = torch.cat([first_inputs, last_inputs], dim=-1)
+        # logits = self.pred_prj(inputs)
+        # (B, T, 1)
+        mask = to_device(xs, make_pad_mask(ilens)).unsqueeze(-1)
+        # (B, T, D)
+        keys = self.K(xs)
+        values = self.V(xs)
+        # (B, T, D) -> (B, T, 1)
+        logits = torch.sum(keys * self.query, dim=-1).unsqueeze(-1) / self.d_k
+        logits = logits.masked_fill(mask, -float('inf'))
+        scores = F.softmax(logits, dim=1)
+        # (B, T, 1) -> (B, 1, T)
+        scores = self.score_dropout(scores.masked_fill(mask, 0.0)).transpose(1, 2)
+        # (B, 1, T) * (B, T, D) -> (B, 1, D)
+        x = torch.matmul(scores, values)
+        # Predict intonation type
+        intotype_logits = None
+        if self.pred_prj is not None:
+            intotype_logits = self.pred_prj(x.squeeze(1))
+        # Return repeated squeezed character embeddings or original encoded embedings
+        if self.reduce_character_embedding:
+            # (B, 1, D) -> (B, T, D)
+            xs = x.expand(-1, xs.size(1), -1).masked_fill(mask, 0.0)
+        return xs, hlens, intotype_logits
 
     def inference(self, x):
         xs = x.unsqueeze(0)
         ilens = torch.tensor([x.size(0)])
-
-        xs = self.embed(xs).transpose(1, 2)
-        if self.convs is not None:
-            for i in six.moves.range(len(self.convs)):
-                if self.use_residual:
-                    xs += self.convs[i](xs)
-                else:
-                    xs = self.convs[i](xs)
-        
-        xs_old = xs.transpose(1, 2)
-
-        if self.blstm is None:
-            return xs_old
-        if not isinstance(ilens, torch.Tensor):
-            ilens = torch.tensor(ilens)
-        xs = pack_padded_sequence(xs_old, ilens.cpu(), batch_first=True)
-        self.blstm.flatten_parameters()
-        xs, _ = self.blstm(xs)  # (B, Tmax, C)
-        xs, hlens = pad_packed_sequence(xs, batch_first=True)
-
-        xs_new = xs + xs_old
-
-        return xs_new[0]
+        xs, hlens, intotype_logits = self.forward(xs, ilens)
+        x = xs[0]
+        intotype_logit = None
+        if intotype_logits is not None:
+            intotype_logit = intotype_logits[0]
+        return x, intotype_logit

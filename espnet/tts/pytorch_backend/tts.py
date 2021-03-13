@@ -326,18 +326,19 @@ def train(args):
             raise ValueError("use_character_embedding should be true when use_intotype_loss is true.")
 
     # write model config
-    if not os.path.exists(args.outdir):
-        os.makedirs(args.outdir)
-    model_conf = args.outdir + "/model.json"
-    with open(model_conf, "wb") as f:
-        logging.info("writing a model config file to" + model_conf)
-        f.write(
-            json.dumps(
-                (idim, odim, vars(args)), indent=4, ensure_ascii=False, sort_keys=True
-            ).encode("utf_8")
-        )
-    for key in sorted(vars(args).keys()):
-        logging.info("ARGS: " + key + ": " + str(vars(args)[key]))
+    if args.local_rank == 0:
+        if not os.path.exists(args.outdir):
+            os.makedirs(args.outdir)
+        model_conf = args.outdir + "/model.json"
+        with open(model_conf, "wb") as f:
+            logging.info("writing a model config file to" + model_conf)
+            f.write(
+                json.dumps(
+                    (idim, odim, vars(args)), indent=4, ensure_ascii=False, sort_keys=True
+                ).encode("utf_8")
+            )
+        for key in sorted(vars(args).keys()):
+            logging.info("ARGS: " + key + ": " + str(vars(args)[key]))
 
     # specify model architecture
     if args.enc_init is not None or args.dec_init is not None:
@@ -754,17 +755,17 @@ def decode(args):
         intotype = None
 
         ## TODO: Add loading of intonation types
+        feat_ord = 1
         if train_args.use_speaker_embedding:
-            spemb = torch.FloatTensor(data[1][0]).to(device)
-            if train_args.use_character_embedding:
-                chemb = torch.FloatTensor(data[2][0]).to(device)
-            if train_args.use_intonation_type:
-                intotype = torch.LongTensor(data[3][0]).to(device)
-        else:
-            if train_args.use_character_embedding:
-                chemb = torch.FloatTensor(data[1][0]).to(device)
-            if train_args.use_intonation_type:
-                intotype = torch.LongTensor(data[2][0]).to(device)
+            spemb = torch.FloatTensor(data[feat_ord][0]).to(device)
+            feat_ord += 1
+        if train_args.use_character_embedding:
+            chemb = torch.FloatTensor(data[feat_ord][0]).to(device)
+            feat_ord += 1
+        if train_args.use_intonation_type:
+            # unsqueeze for correct conversion to tensor and then squeeze the batch dim
+            intotype = torch.LongTensor(np.expand_dims(data[feat_ord][0], axis=0)).squeeze(0).to(device)
+            feat_ord += 1
 
         # decode and write
         start_time = time.time()
@@ -807,3 +808,107 @@ def decode(args):
         dur_writer.close()
     if args.save_focus_rates:
         fr_writer.close()
+
+@torch.no_grad()
+def gta_inference(args):
+    set_deterministic_pytorch(args)
+    # read training config
+    idim, odim, train_args = get_model_conf(args.model, args.model_conf)
+
+    # show arguments
+    for key in sorted(vars(args).keys()):
+        logging.info("args: " + key + ": " + str(vars(args)[key]))
+
+    # define model
+    model_class = dynamic_import(train_args.model_module)
+    model = model_class(idim, odim, train_args)
+    assert isinstance(model, TTSInterface)
+    logging.info(model)
+
+    # load trained model parameters
+    logging.info("reading model parameters from " + args.model)
+    torch_load(args.model, model)
+    model.eval()
+
+    # set torch device
+    device = torch.device("cuda" if args.ngpu > 0 else "cpu")
+    model = model.to(device)
+
+    # read json data
+    with open(args.json, "rb") as f:
+        js = json.load(f)["utts"]
+
+    # check directory
+    outdir = os.path.dirname(args.out)
+    if len(outdir) != 0 and not os.path.exists(outdir):
+        os.makedirs(outdir)
+
+    use_sortagrad = train_args.sortagrad == -1 or train_args.sortagrad > 0
+    if use_sortagrad:
+        train_args.batch_sort_key = "input"
+
+    if args.batch_size is not None:
+        assert args.batch_size > 0
+        batch_size = args.batch_size
+    else:
+        batch_size = args.batch_size
+    
+    # make minibatch list (variable length)
+    train_batchset = make_batchset(
+        js,
+        batch_size,
+        train_args.maxlen_in,
+        train_args.maxlen_out,
+        train_args.minibatches,
+        batch_sort_key=train_args.batch_sort_key,
+        min_batch_size=train_args.ngpu if train_args.ngpu > 1 else 1,
+        shortest_first=use_sortagrad,
+        count=train_args.batch_count,
+        batch_bins=train_args.batch_bins,
+        batch_frames_in=train_args.batch_frames_in,
+        batch_frames_out=train_args.batch_frames_out,
+        batch_frames_inout=train_args.batch_frames_inout,
+        swap_io=True,
+        iaxis=0,
+        oaxis=0,
+    )
+    load_tr = LoadInputsAndTargets(
+        mode="tts",
+        use_speaker_embedding=train_args.use_speaker_embedding,
+        use_second_target=train_args.use_second_target,
+        use_character_embedding=train_args.use_character_embedding,
+        use_intonation_type=train_args.use_intonation_type,
+        preprocess_conf=train_args.preprocess_conf,
+        preprocess_args={"train": True},  # Switch the mode of preprocessing
+        keep_all_data_on_mem=train_args.keep_all_data_on_mem,
+    )
+
+    converter = CustomConverter()
+    # hack to make batchsize argument as 1
+    # actual bathsize is included in a list
+    def transform(data, loader, converter):
+        batch, utt_list = loader(data, return_uttid=True)
+        batch = converter([batch])
+        return batch, utt_list
+    train_dataset = TransformDataset(
+                train_batchset, lambda data: transform(data, load_tr, converter)
+            )
+
+    feat_writer = kaldiio.WriteHelper("ark,scp:{o}.ark,{o}.scp".format(o=args.out))
+
+    for batch, utt_list in train_dataset:
+        x = batch
+        for key in x.keys():
+            x[key] = x[key].to(device)
+
+        outputs = model.gta_inference(**x)
+        olens = x['olens']
+        
+        batch_size = olens.shape[0]
+        for i in range(batch_size):
+            utt_id = utt_list[i]
+            mlspec = outputs[i]
+            ol = olens[i]
+            feat_writer[utt_id] = mlspec[:ol].cpu().numpy()
+    
+    feat_writer.close()

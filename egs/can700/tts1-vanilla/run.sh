@@ -30,6 +30,7 @@ win_length=1024 # window length
 # config files
 train_config=conf/train_pytorch_tacotron2.yaml
 decode_config=conf/decode.yaml
+synthesis_batch_size=192
 
 # decoding related
 model=model.loss.best
@@ -45,7 +46,7 @@ use_spkid=false
 data_dir=/data1/baibing/datasets/CantoneseTTS/CANTTSdata_22050Hz
 lj_data_dir=/data1/baibing/datasets/LJSpeech-1.1/wavs
 char_emb_dir=/data1/baibing/datasets/CantoneseTTS/text_embeddings
-cmvn_path=/data1/baibing/datasets/CantoneseTTS/cmvn_lj_pwg/cmvn.ark
+cmvn_path=/data1/baibing/datasets/CantoneseTTS/cmvns/cmvn_cantts_nopad.ark
 master_port=29507
 
 # exp tag
@@ -146,7 +147,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
     for name in ${train_set} ${train_dev} ${eval_set}; do
         # to store intermediate json files
         tmpdir=${dumpdir}/${name}/tmpdir
-        rm -rf ${tmpdir} && mkdir ${tmpdir}
+        [ ! -d ${tmpdir} ] && mkdir ${tmpdir}
         [ ! -d ${dumpdir}/${name}/.backup ] && mkdir ${dumpdir}/${name}/.backup
         # backup
         cp ${dumpdir}/${name}/data.json ${dumpdir}/${name}/.backup/data.json
@@ -157,10 +158,11 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
             cat data/${name}/wav.scp | awk -F' ' -v dir=$char_emb_dir '{printf "%s %s/%s.npy\n",$1,dir,$1}' > data/${name}/char_emb.scp
             cat data/${name}/char_emb.scp | scp2json.py --key char_emb > ${tmpdir}/char_emb.json
             addjson.py -i False \
-                ${tmpdir}/${name}/data.json \
+                ${tmpdir}/data.json \
                 ${tmpdir}/char_emb.json \
-                > ${tmpdir}/data.json
+                > ${dumpdir}/${name}/data.json
         fi
+        cp ${dumpdir}/${name}/data.json ${tmpdir}/data.json
         # add intonation types to output
         if ${use_intotype}; then
             cat data/${name}/wav.scp \
@@ -172,6 +174,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
                 ${tmpdir}/into_type.json \
                 > ${dumpdir}/${name}/data.json
         fi
+        cp ${dumpdir}/${name}/data.json ${tmpdir}/data.json
         # add speaker ids to output
         if ${use_spkid}; then
             cat data/${name}/wav.scp \
@@ -220,7 +223,7 @@ fi
 if [ ${n_average} -gt 0 ]; then
     model=model.last${n_average}.avg.best
 fi
-outdir=${expdir}/outputs_${model}_$(basename ${decode_config%.*})
+outdir=$(pwd)/${expdir}/outputs_${model}_$(basename ${decode_config%.*})
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
     echo "stage 5: Decoding"
     if [ ${n_average} -gt 0 ]; then
@@ -284,3 +287,22 @@ if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
     [ ${i} -gt 0 ] && echo "$0: ${i} background jobs are failed." && false
     echo "Finished."
 fi
+
+outdir=${expdir}/gta_synthesis
+if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
+    echo "stage 7: Ground truth aligned Synthesis"
+    for set in ${train_set} ${train_dev} ${eval_set}; do
+        [ ! -e ${outdir}/${set} ] && mkdir -p ${outdir}/${set}
+        js=${dumpdir}/${set}/data.json
+        ${cuda_cmd} --gpu ${ngpu} ${outdir}/${set}/gta_synthesis.log \
+            tts_gta_synthesis.py \
+                --ngpu ${ngpu} \
+                --verbose ${verbose} \
+                --out $(pwd)/${outdir}/${set}/feats \
+                --json ${js} \
+                --model ${expdir}/results/${model} \
+                --batch-size ${synthesis_batch_size}
+    done
+    echo "Finished."
+fi
+
