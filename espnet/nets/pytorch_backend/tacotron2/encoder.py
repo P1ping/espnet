@@ -14,8 +14,14 @@ import torch
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.nn.utils.rnn import pad_packed_sequence
 import torch.nn.functional as F
-from espnet.nets.pytorch_backend.nets_utils import make_pad_mask, to_device
+from espnet.nets.pytorch_backend.nets_utils import make_pad_mask, make_non_pad_mask, to_device
 
+from espnet.nets.pytorch_backend.transformer.attention import MultiHeadedAttention
+from espnet.nets.pytorch_backend.transformer.embedding import PositionalEncoding
+from espnet.nets.pytorch_backend.transformer.repeat import repeat
+from espnet.nets.pytorch_backend.transformer.encoder_layer import EncoderLayer
+from espnet.nets.pytorch_backend.transformer.layer_norm import LayerNorm
+from espnet.nets.pytorch_backend.transformer.positionwise_feed_forward import (PositionwiseFeedForward,)
 
 def encoder_init(m):
     """Initialize encoder parameters."""
@@ -305,15 +311,7 @@ class CharacterEncoder(torch.nn.Module):
 
         if self.query is None:
             return xs, hlens, None
-        # # Predict sentence type
-        # first_inputs = xs[:, 0, :]
-        # last_inputs = []
-        # for i in range(xs.shape[0]):
-        #     idx = ilens[i] - 1
-        #     last_inputs.append(xs[i, idx, :])
-        # last_inputs = torch.stack(last_inputs)
-        # inputs = torch.cat([first_inputs, last_inputs], dim=-1)
-        # logits = self.pred_prj(inputs)
+        # Predict sentence type
         # (B, T, 1)
         mask = to_device(xs, make_pad_mask(ilens)).unsqueeze(-1)
         # (B, T, D)
@@ -333,9 +331,143 @@ class CharacterEncoder(torch.nn.Module):
             intotype_logits = self.pred_prj(x.squeeze(1))
         # Return repeated squeezed character embeddings or original encoded embedings
         if self.reduce_character_embedding:
-            # (B, 1, D) -> (B, T, D)
-            xs = x.expand(-1, xs.size(1), -1).masked_fill(mask, 0.0)
+            return x.squeeze(1), None, intotype_logits
+        
         return xs, hlens, intotype_logits
+
+    def inference(self, x):
+        xs = x.unsqueeze(0)
+        ilens = torch.tensor([x.size(0)])
+        xs, hlens, intotype_logits = self.forward(xs, ilens)
+        x = xs[0]
+        intotype_logit = None
+        if intotype_logits is not None:
+            intotype_logit = intotype_logits[0]
+        return x, intotype_logit
+
+
+class SentenceEncoder(torch.nn.Module):
+    def __init__(
+        self,
+        idim,
+        pred_into_type,
+        into_type_num,
+        reduce_character_embedding,
+        attention_dim=256,
+        attention_heads=4,
+        conv_wshare=4,
+        conv_kernel_length=11,
+        conv_usebias=False,
+        linear_units=2048,
+        num_blocks=3,
+        dropout_rate=0.2,
+        positional_dropout_rate=0.1,
+        attention_dropout_rate=0.0,
+        pos_enc_class=PositionalEncoding,
+        normalize_before=True,
+        concat_after=False,
+        positionwise_conv_kernel_size=1,
+        padding_idx=-1,
+        elayers=None,
+        eunits=None,
+    ):
+        """Construct an Encoder object."""
+        super(SentenceEncoder, self).__init__()
+
+        self.conv_subsampling_factor = 1
+        self.embed = torch.nn.Sequential(
+            torch.nn.Linear(idim, attention_dim),
+            torch.nn.LayerNorm(attention_dim),
+            torch.nn.Dropout(dropout_rate),
+            torch.nn.ReLU(),
+            pos_enc_class(attention_dim, positional_dropout_rate),
+        )
+        
+        self.normalize_before = normalize_before
+        
+        positionwise_layer = PositionwiseFeedForward
+        positionwise_layer_args = (attention_dim, linear_units, dropout_rate)
+
+        self.encoders = repeat(
+            num_blocks,
+            lambda lnum: EncoderLayer(
+                attention_dim,
+                MultiHeadedAttention(
+                    attention_heads, attention_dim, attention_dropout_rate
+                ),
+                positionwise_layer(*positionwise_layer_args),
+                dropout_rate,
+                normalize_before,
+                concat_after,
+            ),
+        )
+        if self.normalize_before:
+            self.after_norm = LayerNorm(attention_dim)
+
+        # For reduction
+        self.reduce_character_embedding = reduce_character_embedding
+        self.query = None # For embedding reduction
+        if reduce_character_embedding or pred_into_type:
+            query = torch.nn.Parameter(
+                torch.FloatTensor((attention_dim)),
+                requires_grad=True
+            )
+            self.query = torch.nn.init.uniform_(query)
+            # self.d_k = math.sqrt(eunits)
+            self.K = torch.nn.Linear(attention_dim, attention_dim)
+            # self.V = torch.nn.Linear(eunits, eunits)
+            self.score_dropout = torch.nn.Dropout(p=dropout_rate)
+        
+        # For prediction
+        self.pred_prj = None
+        if pred_into_type:
+            self.pred_prj = torch.nn.Linear(attention_dim, into_type_num)
+
+    def forward(self, xs, ilens=None):
+        """Encode input sequence.
+
+        Args:
+            xs (torch.Tensor): Input tensor (#batch, time, idim).
+            masks (torch.Tensor): Mask tensor (#batch, time).
+
+        Returns:
+            torch.Tensor: Output tensor (#batch, time, attention_dim).
+            torch.Tensor: Mask tensor (#batch, time).
+
+        """
+        masks = to_device(xs, make_non_pad_mask(ilens)).unsqueeze(-2)
+        xs = self.embed(xs)
+        xs, _ = self.encoders(xs, masks)
+        if self.normalize_before:
+            xs = self.after_norm(xs)
+
+        if self.query is None:
+            return xs, ilens, None
+
+        # Predict sentence type
+        # (B, T, 1)
+        mask = to_device(xs, make_pad_mask(ilens)).unsqueeze(-1)
+        # (B, T, D)
+        keys = torch.tanh(self.K(xs))
+        values = xs
+
+        # (B, T, D) -> (B, T, 1)
+        logits = torch.sum(keys * self.query, dim=-1).unsqueeze(-1)
+        logits = logits.masked_fill(mask, -float('inf'))
+        scores = F.softmax(logits, dim=1)
+        # (B, T, 1) -> (B, 1, T)
+        scores = self.score_dropout(scores.masked_fill(mask, 0.0)).transpose(1, 2)
+        # (B, 1, T) * (B, T, D) -> (B, 1, D)
+        x = torch.matmul(scores, values)
+        # Predict intonation type
+        intotype_logits = None
+        if self.pred_prj is not None:
+            intotype_logits = self.pred_prj(x.squeeze(1))
+        # Return repeated squeezed character embeddings or original encoded embedings
+        if self.reduce_character_embedding:
+            return x.squeeze(1), None, intotype_logits
+        
+        return xs, ilens, intotype_logits
 
     def inference(self, x):
         xs = x.unsqueeze(0)

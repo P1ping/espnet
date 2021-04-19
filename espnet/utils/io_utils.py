@@ -369,29 +369,6 @@ class LoadInputsAndTargets(object):
             chembs_name = "chembs_none"
             intotypes_name = "intotypes_none"
 
-            # if self.use_second_target:
-            #     spcs = list(x_feats_dict.values())[1]
-            #     spcs = [spcs[i] for i in nonzero_sorted_idx]
-            #     spcs_name = list(x_feats_dict.keys())[1]
-            # if self.use_speaker_embedding:
-            #     spembs = list(x_feats_dict.values())[1]
-            #     spembs = [spembs[i] for i in nonzero_sorted_idx]
-            #     spembs_name = list(x_feats_dict.keys())[1]
-            # if self.use_character_embedding:
-            #     chembs = list(y_feats_dict.values())[1]
-            #     chembs = [chembs[i] for i in nonzero_sorted_idx]
-            #     # Original character embeddings should be upsampled
-            #     # to match the lengths of phonemes.
-            #     # Further padding maintains length match after
-            #     # adding <eos> to phonemes.
-            #     chembs = [np.pad(chemb, ((0,1),(0,0)), 'constant', constant_values=0)
-            #         for chemb in chembs
-            #     ]
-            #     chembs_name = list(y_feats_dict.keys())[1]
-            # if self.use_intonation_type:
-            #     intotypes = list(y_feats_dict.values())[2]
-            #     intotypes = [intotypes[i] for i in nonzero_sorted_idx]
-            #     intotypes_name = list(y_feats_dict.keys())[2]
             if self.use_second_target:
                 spcs = list(x_feats_dict.values())[1]
                 spcs = [spcs[i] for i in nonzero_sorted_idx]
@@ -409,9 +386,9 @@ class LoadInputsAndTargets(object):
                 # to match the lengths of phonemes.
                 # Further padding maintains length match after
                 # adding <eos> to phonemes.
-                chembs = [np.pad(chemb, ((0,1),(0,0)), 'constant', constant_values=0)
-                    for chemb in chembs
-                ]
+                # chembs = [np.pad(chemb, ((0,1),(0,0)), 'constant', constant_values=0)
+                #     for chemb in chembs
+                # ]
                 chembs_name = list(y_feats_dict.keys())[feat_ord]
                 feat_ord += 1
             if self.use_intonation_type:

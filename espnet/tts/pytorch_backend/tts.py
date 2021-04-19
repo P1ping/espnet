@@ -264,6 +264,8 @@ class CustomConverter(object):
 
         # load character embedding
         if chembs is not None:
+            chlens = torch.from_numpy(np.array([emb.shape[0] for emb in chembs])).long().to(device)
+            new_batch["chlens"] = chlens.to(device)
             chembs = pad_list([torch.from_numpy(chemb).float() for chemb in chembs], 0)
             new_batch["chembs"] = chembs.to(device)
 

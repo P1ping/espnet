@@ -9,14 +9,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from espnet.nets.pytorch_backend.nets_utils import make_non_pad_mask
+from espnet.nets.pytorch_backend.nets_utils import make_pad_mask, make_non_pad_mask, to_device
 from espnet.nets.pytorch_backend.rnn.attentions import AttForward
 from espnet.nets.pytorch_backend.rnn.attentions import AttForwardTA
 from espnet.nets.pytorch_backend.rnn.attentions import AttLoc
 from espnet.nets.pytorch_backend.tacotron2.cbhg import CBHG
 from espnet.nets.pytorch_backend.tacotron2.cbhg import CBHGLoss
 from espnet.nets.pytorch_backend.tacotron2.decoder import Decoder
-from espnet.nets.pytorch_backend.tacotron2.encoder import Encoder, CharacterEncoder
+from espnet.nets.pytorch_backend.tacotron2.encoder import Encoder, CharacterEncoder, SentenceEncoder
 from espnet.nets.tts_interface import TTSInterface
 from espnet.utils.cli_utils import strtobool
 from espnet.utils.fill_missing_args import fill_missing_args
@@ -171,7 +171,7 @@ class IntoTypeLoss(torch.nn.Module):
             into_statement_weight=1.0,
             into_normal_weight=10.0,
             into_unmarked_weight=20.0,
-            loss_weight = 0.2,
+            loss_weight = 0.1,
     ):
         super(IntoTypeLoss, self).__init__()
         assert into_type_num == 2 or into_type_num == 3
@@ -663,9 +663,16 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         )
         self.pre_enc = None
         self.ch_enc = None
+
+        chenc_type = CharacterEncoder
+        chenc_odim = args.eunits
+        if args.character_encoder_type == 'transformer':
+            chenc_type = SentenceEncoder
+            chenc_odim = 256
+
         if args.char_embed_dim is not None:
             if args.character_embedding_position == 'encoder':
-                self.pre_enc = CharacterEncoder(
+                self.pre_enc = chenc_type(
                     idim=args.char_embed_dim,
                     pred_into_type=args.use_intotype_loss,
                     into_type_num=args.into_type_num,
@@ -674,7 +681,7 @@ class Tacotron2(TTSInterface, torch.nn.Module):
                     eunits=args.eunits,
                 )
             elif args.character_embedding_position == 'decoder':
-                self.ch_enc = CharacterEncoder(
+                self.ch_enc = chenc_type(
                     idim=args.char_embed_dim,
                     pred_into_type=args.use_intotype_loss,
                     into_type_num=args.into_type_num,
@@ -683,7 +690,7 @@ class Tacotron2(TTSInterface, torch.nn.Module):
                     eunits=args.eunits,
                 )
             elif args.character_embedding_position == 'both':
-                self.pre_enc = CharacterEncoder(
+                self.pre_enc = chenc_type(
                     idim=args.char_embed_dim,
                     pred_into_type=args.use_intotype_loss,
                     into_type_num=args.into_type_num,
@@ -691,7 +698,7 @@ class Tacotron2(TTSInterface, torch.nn.Module):
                     elayers=args.elayers,
                     eunits=args.eunits,
                 )
-                self.ch_enc = CharacterEncoder(
+                self.ch_enc = chenc_type(
                     idim=args.char_embed_dim,
                     pred_into_type=False,
                     into_type_num=0,
@@ -714,7 +721,7 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         if args.spk_embed_dim:
             dec_idim += args.spk_embed_dim
         if self.ch_enc is not None:
-            dec_idim += args.eunits
+            dec_idim += chenc_odim
         if args.into_embed_dim:
             dec_idim += args.into_embed_dim
 
@@ -799,8 +806,19 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         if args.pretrained_model is not None:
             self.load_pretrained_model(args.pretrained_model)
 
+    def expand_to(self, xs, lens):
+        """
+            xs: (B, D)
+            lens: (B,)
+        """
+        # (B, T, 1)
+        mask = to_device(xs, make_pad_mask(lens).unsqueeze(-1))
+        # (B, D) -> (B, 1, D) -> (B, T, D)
+        xs = xs.unsqueeze(1).expand(-1, mask.size(1), -1).masked_fill(mask, 0.0)
+        return xs
+
     def forward(
-        self, xs, ilens, ys, labels, olens, chembs=None, intotypes=None, spembs=None, extras=None, *args, **kwargs
+        self, xs, ilens, ys, labels, olens, chembs=None, chlens=None, intotypes=None, spembs=None, extras=None, *args, **kwargs
     ):
         """Calculate forward propagation.
 
@@ -830,7 +848,9 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         # calculate tacotron2 outputs
         pre_xs = None
         if self.pre_enc is not None:
-            pre_xs, _, pre_type_logits = self.pre_enc(chembs, ilens)
+            pre_xs, _, pre_type_logits = self.pre_enc(chembs, chlens)
+            if pre_xs.ndim != hs.ndim:
+                pre_xs = self.expand_to(pre_xs, ilens)
 
         hs, hlens = self.enc(xs, ilens, pre_xs)
         if self.spk_embed_dim is not None:
@@ -838,7 +858,9 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             hs = torch.cat([hs, spembs], dim=-1)
 
         if self.ch_enc is not None:
-            ch_hs, _, ch_type_logits = self.ch_enc(chembs, ilens)
+            ch_hs, _, ch_type_logits = self.ch_enc(chembs, chlens)
+            if ch_hs.ndim != hs.ndim:
+                ch_hs = self.expand_to(ch_hs, ilens)
             hs = torch.cat([hs, ch_hs], dim=-1)
 
         if self.into_embed_dim is not None:
@@ -939,6 +961,8 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         pre_x = None
         if self.pre_enc is not None:
             pre_x, pre_type_logit = self.pre_enc.inference(chemb)
+            if pre_x.ndim != x.ndim:
+                pre_x = self.expand_to(pre_x.unsqueeze(0), torch.tensor([x.size(0)])).squeeze(0)
             # To print prediction of intonation types
             if pre_type_logit is not None:
                 pre_type_logit = pre_type_logit.data.cpu().numpy()
@@ -951,6 +975,8 @@ class Tacotron2(TTSInterface, torch.nn.Module):
             h = torch.cat([h, spemb], dim=-1)
         if self.ch_enc is not None:
             ch_h, ch_type_logit = self.ch_enc.inference(chemb)
+            if ch_h.ndim != h.ndim:
+                ch_h = self.expand_to(ch_h.unsqueeze(0), torch.tensor([x.size(0)])).squeeze(0)
             # To print prediction of intonation types
             if ch_type_logit is not None:
                 ch_type_logit = ch_type_logit.data.cpu().numpy()
@@ -974,14 +1000,10 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         if self.use_cbhg:
             outs = self.cbhg.inference(outs)
         return outs, probs, att_ws
-        # if self.use_cbhg:
-        #     cbhg_outs = self.cbhg.inference(outs)
-        #     return cbhg_outs, probs, att_ws
-        # else:
-        #     return outs, probs, att_ws
+
 
     def calculate_all_attentions(
-        self, xs, ilens, ys, chembs=None, intotypes=None, spembs=None, keep_tensor=False, *args, **kwargs
+        self, xs, ilens, ys, chembs=None, chlens=None, intotypes=None, spembs=None, keep_tensor=False, *args, **kwargs
     ):
         """Calculate all of the attention weights.
 
@@ -1006,13 +1028,17 @@ class Tacotron2(TTSInterface, torch.nn.Module):
         with torch.no_grad():
             pre_xs = None
             if self.pre_enc is not None:
-                pre_xs, _, pre_type_logits = self.pre_enc(chembs, ilens)
+                pre_xs, _, pre_type_logits = self.pre_enc(chembs, chlens)
+                if pre_xs.ndim != hs.ndim:
+                    pre_xs = self.expand_to(pre_xs, ilens)
             hs, hlens = self.enc(xs, ilens, pre_xs)
             if self.spk_embed_dim is not None:
                 spembs = F.normalize(spembs).unsqueeze(1).expand(-1, hs.size(1), -1)
                 hs = torch.cat([hs, spembs], dim=-1)
             if self.ch_enc is not None:
-                ch_hs, _, ch_type_logits = self.ch_enc(chembs, ilens)
+                ch_hs, _, ch_type_logits = self.ch_enc(chembs, chlens)
+                if ch_hs.ndim != hs.ndim:
+                    ch_hs = self.expand_to(ch_hs, ilens)
                 hs = torch.cat([hs, ch_hs], dim=-1)
             if self.into_embed_dim is not None:
                 itembs = self.into_embed(intotypes).unsqueeze(1).expand(-1, hs.size(1), -1)

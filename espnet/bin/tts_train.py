@@ -303,6 +303,13 @@ def get_parser():
         help="Whether to use character embedding",
     )
     parser.add_argument(
+        "--character-encoder-type",
+        default='tacotron',
+        choices=['tacotron', 'transformer'],
+        type=str,
+        help="Whether to squeeze a sequence of character embeddings into a vector",
+    )
+    parser.add_argument(
         "--reduce-character-embedding",
         default=False,
         type=strtobool,
